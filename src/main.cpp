@@ -20,6 +20,10 @@ static const uint32_t DDP_TIMEOUT_MS    = 10000;
 static const uint8_t  DDP_HEADER_LEN    = 10;
 static const uint8_t  DDP_FLAG_PUSH     = 0x01; // byte 0 bit 0 per the DDP spec
 static const uint8_t  DDP_MAX_DRAIN     = 16;   // packets per loop(), bounds latency
+static const char*    FW_VERSION        = "4.0";
+static const uint16_t FW_VERSION_MAJOR  = 4;
+static const uint16_t FW_VERSION_MINOR  = 0;
+static const uint8_t  FPP_TYPE_ESP8266  = 0xC2; // FPP's id for an ESP8266 board
 static const uint16_t FPP_PORT          = 32320;
 static const uint8_t  MAX_SPARSE_RANGES = 8;
 static const uint8_t  SD_CS_PIN         = 15; // D8; MISO=D6 MOSI=D7 CLK=D5
@@ -769,6 +773,119 @@ void handleStopGet() {
     server.send(302, "text/plain", "");
 }
 
+// ── FPP-compatible HTTP API ───────────────────────────────────────────────────
+// Just enough of the FPP surface for xLights FPP Connect to discover this
+// board and push sequences to it. Field names mirror what FPP itself returns;
+// xLights matches on them.
+
+static void fppSysInfo(JsonObject o) {
+    o["HostName"]        = config.hostname;
+    o["HostDescription"] = config.hostname;
+    o["Platform"]        = "ESPixelStick";
+    o["Variant"]         = "PixelController-ESP8266";
+    o["Mode"]            = sdAvailable ? "remote" : "bridge";
+    o["Version"]         = FW_VERSION;
+    o["majorVersion"]    = FW_VERSION_MAJOR;
+    o["minorVersion"]    = FW_VERSION_MINOR;
+    o["typeId"]          = FPP_TYPE_ESP8266;
+    o["UUID"]            = WiFi.macAddress();
+
+    JsonObject util = o["Utilization"].to<JsonObject>();
+    util["MemoryFree"] = ESP.getFreeHeap();
+    util["Uptime"]     = millis();
+
+    o["rssi"] = WiFi.RSSI();
+    JsonArray ips = o["IPS"].to<JsonArray>();
+    ips.add(WiFi.localIP().toString());
+}
+
+void handleFppSysInfo() {
+    JsonDocument doc;
+    fppSysInfo(doc.to<JsonObject>());
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+void handleFppStatus() {
+    JsonDocument doc;
+    JsonObject o = doc.to<JsonObject>();
+    fppSysInfo(o);
+    o["fppd"]            = "running";
+    o["status"]          = playState == PlayState::IDLE ? 0 : 1;
+    o["status_name"]     = playState == PlayState::IDLE ? "idle" : "playing";
+    o["current_sequence"] = playState == PlayState::IDLE ? "" : String(seqFileName);
+    o["seconds_played"]  = playState == PlayState::IDLE
+                         ? 0 : (millis() - syncMs) / 1000;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+// GET /api/sequence/<name>/meta — xLights asks this before uploading so it can
+// skip a file the card already has.
+void handleFppSequenceMeta(const String& name) {
+    if (!sdAvailable) initSD();
+    File32 f;
+    String path = name.startsWith("/") ? name : "/" + name;
+    if (!sdAvailable || !f.open(path.c_str(), O_RDONLY)) {
+        server.send(404, "application/json", "{\"error\":\"not found\"}");
+        return;
+    }
+
+    uint8_t h[32];
+    int got = f.read(h, sizeof(h));
+    uint32_t fileSize = f.fileSize();
+    f.close();
+    if (got < (int)sizeof(h) || memcmp(h, "PSEQ", 4) != 0) {
+        server.send(404, "application/json", "{\"error\":\"not an fseq\"}");
+        return;
+    }
+
+    JsonDocument doc;
+    JsonObject o = doc.to<JsonObject>();
+    o["Name"]            = name;
+    o["Version"]         = String(h[7]) + "." + String(h[6]);
+    o["StepTime"]        = h[18];
+    o["NumFrames"]       = (uint32_t)h[14] | ((uint32_t)h[15] << 8)
+                         | ((uint32_t)h[16] << 16) | ((uint32_t)h[17] << 24);
+    o["ChannelCount"]    = (uint32_t)h[10] | ((uint32_t)h[11] << 8)
+                         | ((uint32_t)h[12] << 16) | ((uint32_t)h[13] << 24);
+    o["MaxChannel"]      = o["ChannelCount"];
+    o["CompressionType"] = h[20];
+    o["FileSize"]        = fileSize;
+
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+// /fpp and /fpp/... dispatch on a ?path= argument, the way FPP does.
+void handleFppGet() {
+    String path = server.hasArg("path") ? server.arg("path") : server.uri();
+    if (path.startsWith("/fpp/")) path = path.substring(4);
+
+    if (path.indexOf("system/info") >= 0)   { handleFppSysInfo(); return; }
+    if (path.indexOf("system/status") >= 0) { handleFppStatus();  return; }
+    if (path == "ping" || path == "/" || path.length() == 0) {
+        server.send(200, "text/plain", "OK");
+        return;
+    }
+    server.send(404, "text/plain", "");
+}
+
+// Catches the wildcard routes ESP8266WebServer can't register directly.
+void handleNotFound() {
+    String uri = server.uri();
+    if (uri.startsWith("/api/sequence/")) {
+        String seq = uri.substring(14);
+        if (seq.endsWith("/meta")) seq = seq.substring(0, seq.length() - 5);
+        handleFppSequenceMeta(seq);
+        return;
+    }
+    server.send(404, "text/plain", "Not found");
+}
+
 // Streamed straight to the card in chunks — sequences run to many megabytes,
 // far past what will fit in RAM.
 void handleUploadData() {
@@ -871,6 +988,13 @@ void startStation() {
     server.on("/play",   HTTP_GET,  handlePlayGet);
     server.on("/stop",   HTTP_GET,  handleStopGet);
     server.on("/upload", HTTP_POST, handleUploadDone, handleUploadData);
+
+    // FPP-compatible surface for xLights FPP Connect
+    server.on("/fpp",                HTTP_GET,  handleFppGet);
+    server.on("/fpp",                HTTP_POST, handleUploadDone, handleUploadData);
+    server.on("/api/system/info",    HTTP_GET,  handleFppSysInfo);
+    server.on("/api/system/status",  HTTP_GET,  handleFppStatus);
+    server.onNotFound(handleNotFound);
     server.begin();
 
     Serial.printf("Connected — IP: %s  hostname: %s.local  pixels: %u\n",
