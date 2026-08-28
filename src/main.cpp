@@ -20,9 +20,9 @@ static const uint32_t DDP_TIMEOUT_MS    = 10000;
 static const uint8_t  DDP_HEADER_LEN    = 10;
 static const uint8_t  DDP_FLAG_PUSH     = 0x01; // byte 0 bit 0 per the DDP spec
 static const uint8_t  DDP_MAX_DRAIN     = 16;   // packets per loop(), bounds latency
-static const char*    FW_VERSION        = "4.0";
-static const uint16_t FW_VERSION_MAJOR  = 4;
-static const uint16_t FW_VERSION_MINOR  = 0;
+static const char*    FW_VERSION        = "0.1.0";
+static const uint16_t FW_VERSION_MAJOR  = 0;
+static const uint16_t FW_VERSION_MINOR  = 1;
 static const uint8_t  FPP_TYPE_ESP8266  = 0xC2; // FPP's id for an ESP8266 board
 static const uint16_t FPP_PORT          = 32320;
 static const uint8_t  MAX_SPARSE_RANGES = 8;
@@ -293,13 +293,13 @@ void sendFPPPing(IPAddress dest) {
     pkt[7]  = 0x03;          // ping_version
     pkt[8]  = 0x00;          // ping_subtype: announce (not a discover request)
     pkt[9]  = 0xC2;          // ping_hardware: ESP8266
-    pkt[10] = 4; pkt[11] = 0; // versionMajor = 4
-    pkt[12] = 0; pkt[13] = 0; // versionMinor = 0
+    pkt[10] = FW_VERSION_MAJOR >> 8; pkt[11] = FW_VERSION_MAJOR & 0xFF; // BE
+    pkt[12] = FW_VERSION_MINOR >> 8; pkt[13] = FW_VERSION_MINOR & 0xFF;
     pkt[14] = 0x08;           // operatingMode: bridge
     uint32_t ip = (uint32_t)WiFi.localIP();
     memcpy(pkt + 15, &ip, 4);
     strncpy((char*)(pkt + 19),  config.hostname.c_str(), 64);
-    strncpy((char*)(pkt + 84),  "4.0",                   40);
+    strncpy((char*)(pkt + 84),  FW_VERSION,              40);
     strncpy((char*)(pkt + 125), "ESPixelStick-ESP8266",  40);
     // ranges[121] at [166] — empty = whole universe
 
