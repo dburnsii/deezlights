@@ -1,0 +1,23 @@
+# PlatformIO build output
+.pio/
+
+# Python virtualenv used to run PlatformIO
+.venv/
+
+# Upstream ESPixelStick source kept locally for reference only.
+# Not our code; includes node_modules and vendored deps.
+reference/
+
+# Real device config — contains WiFi SSID and PSK.
+# Copy data/config.example.json to data/config.json and fill in locally.
+data/config.json
+
+# Build artifacts
+*.bin
+*.elf
+*.map
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
