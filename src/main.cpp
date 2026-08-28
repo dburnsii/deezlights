@@ -17,6 +17,9 @@ static const char*    AP_PASSWORD       = "setup1234";
 static const uint32_t CONNECT_TIMEOUT   = 15000;
 static const uint16_t DDP_PORT          = 4048;
 static const uint32_t DDP_TIMEOUT_MS    = 10000;
+static const uint8_t  DDP_HEADER_LEN    = 10;
+static const uint8_t  DDP_FLAG_PUSH     = 0x01; // byte 0 bit 0 per the DDP spec
+static const uint8_t  DDP_MAX_DRAIN     = 16;   // packets per loop(), bounds latency
 static const uint16_t FPP_PORT          = 32320;
 static const uint8_t  MAX_SPARSE_RANGES = 8;
 static const uint8_t  SD_CS_PIN         = 15; // D8; MISO=D6 MOSI=D7 CLK=D5
@@ -29,6 +32,13 @@ PixelStrip* strip = nullptr;
 
 SdFat32 sd;
 bool    sdAvailable = false;
+
+// Upload state, valid only for the duration of one POST /upload
+File32   uploadFile;
+String   uploadPath;
+String   uploadError;
+uint32_t uploadBytes = 0;
+bool     uploadOk    = false;
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
@@ -189,40 +199,55 @@ void updatePlayback() {
 
 // ── DDP ───────────────────────────────────────────────────────────────────────
 
+// Drain every DDP packet queued this iteration, apply all of it to the pixel
+// buffer, then latch once. Showing per-packet tears a frame that arrives as
+// several packets, and consuming only one packet per loop() lets a fast sender
+// overrun the small lwIP receive queue — both look like flicker on the strip.
 void handleDDP() {
-    int size = ddpUdp.parsePacket();
-    if (size < 10) return;
+    bool     touched = false;
+    bool     pushed  = false;
+    uint8_t  drained = 0;
 
-    uint8_t header[10];
-    ddpUdp.read(header, 10);
+    while (drained < DDP_MAX_DRAIN) {
+        int size = ddpUdp.parsePacket();
+        if (size < DDP_HEADER_LEN) break;
+        drained++;
 
-    uint32_t byteOffset = ((uint32_t)header[4] << 24) | ((uint32_t)header[5] << 16)
-                        | ((uint32_t)header[6] <<  8) |  (uint32_t)header[7];
-    uint16_t byteLen    = ((uint16_t)header[8] << 8) | header[9];
+        uint8_t header[DDP_HEADER_LEN];
+        ddpUdp.read(header, DDP_HEADER_LEN);
+
+        uint32_t byteOffset = ((uint32_t)header[4] << 24) | ((uint32_t)header[5] << 16)
+                            | ((uint32_t)header[6] <<  8) |  (uint32_t)header[7];
+        uint16_t byteLen    = ((uint16_t)header[8] << 8) | header[9];
+
+        if (header[0] & DDP_FLAG_PUSH) pushed = true;
+
+        uint16_t pixelStart = byteOffset / 3;
+        uint16_t pixelCount = byteLen    / 3;
+
+        for (uint16_t i = 0; i < pixelCount; i++) {
+            uint8_t rgb[3] = {0, 0, 0};
+            if (ddpUdp.read(rgb, 3) < 3) break;
+            if (pixelStart + i < config.pixelCount)
+                strip->SetPixelColor(pixelStart + i, RgbColor(rgb[0], rgb[1], rgb[2]));
+        }
+        touched = true;
+    }
+
+    if (!touched) return;
+    lastDdpMs = millis();
 
     static uint32_t lastLog = 0;
     if (millis() - lastLog > 2000) {
         lastLog = millis();
-        Serial.printf("DDP: size=%d hdr=%02x %02x %02x %02x  offset=%u len=%u push=%d\n",
-            size, header[0], header[1], header[2], header[3],
-            byteOffset, byteLen, (header[0] & 0x02) != 0);
+        Serial.printf("DDP: drained=%u push=%d canShow=%d\n",
+                      drained, pushed, strip->CanShow());
     }
 
-    uint16_t pixelStart = byteOffset / 3;
-    uint16_t pixelCount = byteLen    / 3;
-
-    for (uint16_t i = 0; i < pixelCount; i++) {
-        uint8_t rgb[3] = {0, 0, 0};
-        if (ddpUdp.read(rgb, 3) < 3) break;
-        if (pixelStart + i < config.pixelCount)
-            strip->SetPixelColor(pixelStart + i, RgbColor(rgb[0], rgb[1], rgb[2]));
-    }
-
-    // TODO: buffer multi-packet frames and only Show() on push flag for large
-    // strings (>480 pixels) where a single frame spans multiple DDP packets.
-    // Currently safe — single packet per frame at 340 pixels.
-    strip->Show();
-    lastDdpMs = millis();
+    // Non-blocking latch. If the previous transmit is still on the wire we skip
+    // this one and keep the newer data — dropping a stale frame beats blocking
+    // loop() and backing up the receive queue.
+    if (strip->CanShow()) strip->Show();
 }
 
 // ── FPP packets ───────────────────────────────────────────────────────────────
@@ -588,11 +613,38 @@ td a{color:#198754;text-decoration:none;font-weight:600}
 td a:hover{text-decoration:underline}
 a.btn{display:inline-block;margin-top:16px;padding:9px 16px;border-radius:4px;text-decoration:none;color:#fff;font-size:.9em}
 .back{background:#6c757d}.back:hover{background:#5a6268}
-.stop{background:#dc3545;margin-left:8px}.stop:hover{background:#bb2d3b}</style>
+.stop{background:#dc3545;margin-left:8px}.stop:hover{background:#bb2d3b}
+#up{margin-top:8px}
+#bar{height:6px;background:#eee;border-radius:3px;overflow:hidden;margin-top:10px;display:none}
+#fill{height:100%;width:0;background:#198754;transition:width .2s}
+#msg{font-size:.85em;color:#666;margin-top:6px;min-height:1em}</style>
 </head><body>
 <h1>SD Card</h1>
 %SD_CONTENT%
+<h2>Upload sequence</h2>
+<input type="file" id="up" accept=".fseq,.FSEQ">
+<div id="bar"><div id="fill"></div></div>
+<div id="msg"></div>
 <a class="btn back" href="/">&#8592; Back</a>
+<script>
+document.getElementById('up').onchange=function(){
+  var f=this.files[0]; if(!f) return;
+  var bar=document.getElementById('bar'),fill=document.getElementById('fill'),
+      msg=document.getElementById('msg'),fd=new FormData();
+  fd.append('f',f,f.name);
+  bar.style.display='block'; msg.textContent='Uploading '+f.name+'…'; this.disabled=true;
+  var x=new XMLHttpRequest();
+  x.upload.onprogress=function(e){
+    if(e.lengthComputable) fill.style.width=(e.loaded/e.total*100)+'%';
+  };
+  x.onload=function(){
+    if(x.status==200){ msg.textContent='Done. Reloading…'; location.reload(); }
+    else { msg.textContent='Failed: '+x.responseText; fill.style.background='#dc3545'; }
+  };
+  x.onerror=function(){ msg.textContent='Upload failed (connection lost)'; fill.style.background='#dc3545'; };
+  x.open('POST','/upload'); x.send(fd);
+};
+</script>
 </body></html>
 )html";
 
@@ -717,6 +769,74 @@ void handleStopGet() {
     server.send(302, "text/plain", "");
 }
 
+// Streamed straight to the card in chunks — sequences run to many megabytes,
+// far past what will fit in RAM.
+void handleUploadData() {
+    HTTPUpload& up = server.upload();
+
+    if (up.status == UPLOAD_FILE_START) {
+        uploadOk    = false;
+        uploadBytes = 0;
+
+        // Playback holds seqFile open on the same card; stop before writing.
+        if (playState != PlayState::IDLE) closeSequence();
+        if (!sdAvailable) initSD();
+        if (!sdAvailable) { uploadError = "No SD card"; return; }
+
+        // Some browsers send a full path — keep the basename only so an upload
+        // can never escape the card root.
+        String name = up.filename;
+        int cut = name.lastIndexOf('/');
+        if (cut >= 0) name = name.substring(cut + 1);
+        cut = name.lastIndexOf('\\');
+        if (cut >= 0) name = name.substring(cut + 1);
+        if (name.length() == 0) { uploadError = "Empty filename"; return; }
+
+        uploadPath = "/" + name;
+        sd.remove(uploadPath.c_str());
+        uploadOk = uploadFile.open(uploadPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        if (!uploadOk) uploadError = "Could not open " + uploadPath + " for write";
+        else           Serial.printf("Upload start: %s\n", uploadPath.c_str());
+
+    } else if (up.status == UPLOAD_FILE_WRITE) {
+        if (uploadOk) {
+            if (uploadFile.write(up.buf, up.currentSize) != up.currentSize) {
+                uploadError = "Write failed — card full?";
+                uploadFile.close();
+                sd.remove(uploadPath.c_str());
+                uploadOk = false;
+            } else {
+                uploadBytes += up.currentSize;
+            }
+        }
+
+    } else if (up.status == UPLOAD_FILE_END) {
+        if (uploadOk) {
+            uploadFile.close();
+            Serial.printf("Upload done: %s (%u bytes)\n", uploadPath.c_str(), uploadBytes);
+        }
+
+    } else if (up.status == UPLOAD_FILE_ABORTED) {
+        if (uploadOk) {
+            uploadFile.close();
+            sd.remove(uploadPath.c_str());
+            uploadOk = false;
+        }
+        uploadError = "Upload aborted";
+    }
+}
+
+void handleUploadDone() {
+    if (uploadOk) {
+        server.send(200, "text/plain",
+                    "OK " + uploadPath + " (" + String(uploadBytes) + " bytes)");
+    } else {
+        String msg = uploadError.length() ? uploadError : String("Upload failed");
+        uploadError = "";
+        server.send(500, "text/plain", msg);
+    }
+}
+
 // ── Startup modes ─────────────────────────────────────────────────────────────
 
 void startAP() {
@@ -750,6 +870,7 @@ void startStation() {
     server.on("/sd",     HTTP_GET,  handleSdGet);
     server.on("/play",   HTTP_GET,  handlePlayGet);
     server.on("/stop",   HTTP_GET,  handleStopGet);
+    server.on("/upload", HTTP_POST, handleUploadDone, handleUploadData);
     server.begin();
 
     Serial.printf("Connected — IP: %s  hostname: %s.local  pixels: %u\n",
