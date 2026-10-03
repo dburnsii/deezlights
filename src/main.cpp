@@ -1,11 +1,20 @@
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266HTTPUpdateServer.h>
+#ifdef ESP32
+  #include <WiFi.h>
+  #include <WebServer.h>
+  #include <HTTPUpdateServer.h>
+  #include <SPI.h>
+#else
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+  #include <ESP8266HTTPUpdateServer.h>
+#endif
 #include <ArduinoOTA.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <NeoPixelBus.h>
+#ifndef ESP32
+  #include <NeoPixelBus.h>
+#endif
 #include <WiFiUdp.h>
 #include <SdFat.h>
 
@@ -20,19 +29,33 @@ static const uint32_t DDP_TIMEOUT_MS    = 10000;
 static const uint8_t  DDP_HEADER_LEN    = 10;
 static const uint8_t  DDP_FLAG_PUSH     = 0x01; // byte 0 bit 0 per the DDP spec
 static const uint8_t  DDP_MAX_DRAIN     = 16;   // packets per loop(), bounds latency
-static const char*    FW_VERSION        = "0.1.0";
+static const char*    FW_VERSION        = "0.2.0";
 static const uint16_t FW_VERSION_MAJOR  = 0;
-static const uint16_t FW_VERSION_MINOR  = 1;
-static const uint8_t  FPP_TYPE_ESP8266  = 0xC2; // FPP's id for an ESP8266 board
+static const uint16_t FW_VERSION_MINOR  = 2;
+#ifdef ESP32
+static const uint8_t  FPP_TYPE_ESP          = 0xC3; // FPP's id for an ESP32 board
+static const char*    FPP_HW_NAME           = "ESPixelStick-ESP32";
+static const char*    FPP_VARIANT           = "PixelController-ESP32";
+static const uint8_t  PIXEL_PIN             = 4;  // default for a fresh config
+static const uint8_t  SD_CS_PIN             = 5;  // VSPI: SCK=18 MISO=19 MOSI=23
+static const uint8_t  SD_RESERVED_PINS[]    = {5, 18, 19, 23};
+#else
+static const uint8_t  FPP_TYPE_ESP          = 0xC2; // FPP's id for an ESP8266 board
+static const char*    FPP_HW_NAME           = "ESPixelStick-ESP8266";
+static const char*    FPP_VARIANT           = "PixelController-ESP8266";
+static const uint8_t  PIXEL_PIN             = 2;  // GPIO2 (D4), UART1 — fixed on ESP8266
+static const uint8_t  SD_CS_PIN             = 15; // D8; MISO=D6 MOSI=D7 CLK=D5
+#endif
 static const uint16_t FPP_PORT          = 32320;
 static const uint8_t  MAX_SPARSE_RANGES = 8;
-static const uint8_t  SD_CS_PIN         = 15; // D8; MISO=D6 MOSI=D7 CLK=D5
 
 // ── Hardware ──────────────────────────────────────────────────────────────────
 
-// WS2811 output on GPIO2 (D4) via UART1 — non-blocking, WiFi-safe
+#ifndef ESP32
+// ESP8266: one WS2811 string on GPIO2 (D4) via UART1 — non-blocking, WiFi-safe
 using PixelStrip = NeoPixelBus<NeoRgbFeature, NeoEsp8266Uart1Ws2811Method>;
 PixelStrip* strip = nullptr;
+#endif
 
 SdFat32 sd;
 bool    sdAvailable = false;
@@ -46,8 +69,13 @@ bool     uploadOk    = false;
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
+#ifdef ESP32
+WebServer             server(80);
+HTTPUpdateServer      httpUpdater;
+#else
 ESP8266WebServer      server(80);
 ESP8266HTTPUpdateServer httpUpdater;
+#endif
 WiFiUDP               ddpUdp;
 WiFiUDP               fppUdp;
 bool                  apMode    = false;
@@ -55,14 +83,209 @@ uint32_t              lastDdpMs = 0;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+// ── Outputs (config) ──────────────────────────────────────────────────────────
+// Each output is one GPIO: a pixel string (WS2811/WS2812/SK6812 family, any
+// colour order, 3 or 4 channels per pixel) or a single PWM channel. Outputs take
+// consecutive slices of one channel space, in list order — that is the channel
+// numbering DDP and FSEQ address.
+
+static const uint8_t  MAX_OUTPUTS        = 16;
+static const uint16_t MAX_PIXELS_PER_OUT = 1024;
+#ifdef ESP32
+static const uint32_t MAX_TOTAL_CHANNELS = 4096;
+#else
+static const uint32_t MAX_TOTAL_CHANNELS = 3072;
+#endif
+
+enum class OutType : uint8_t { PIXEL, PWM };
+
+struct OutputCfg {
+    uint8_t  pin      = PIXEL_PIN;
+    OutType  type     = OutType::PIXEL;
+    char     order[5] = "RGB";  // wire colour order; 4 letters = RGBW pixels
+    uint16_t count    = 30;     // pixels (PIXEL only)
+    uint16_t freq     = 1000;   // Hz (PWM only)
+};
+
+static uint32_t channelsOf(const OutputCfg& o) {
+    return o.type == OutType::PWM ? 1 : (uint32_t)o.count * strlen(o.order);
+}
+
 struct Config {
     String   ssid;
     String   password;
     String   hostname         = "pixelcontroller";
-    uint16_t pixelCount       = 30;
-    bool     animationEnabled = true;
+    float    gamma            = 1.0f;
+    OutputCfg outputs[MAX_OUTPUTS];
+    uint8_t   outputCount     = 1;
 };
 Config config;
+
+// ── Gamma correction ──────────────────────────────────────────────────────────
+
+uint8_t gammaLUT[256];
+
+void rebuildGammaLUT() {
+    for (uint16_t i = 0; i < 256; i++) {
+        gammaLUT[i] = (uint8_t)(powf((float)i / 255.0f, config.gamma) * 255.0f + 0.5f);
+    }
+}
+
+// ── Outputs (runtime) ─────────────────────────────────────────────────────────
+
+static bool orderValid(const char* order) {
+    size_t n = strlen(order);
+    if (n != 3 && n != 4) return false;
+    for (size_t i = 0; i < n; i++) {
+        if (!strchr("RGBW", order[i])) return false;
+        for (size_t k = 0; k < i; k++) if (order[k] == order[i]) return false;
+    }
+    return n == 4 || !strchr(order, 'W');
+}
+
+static bool pinUsable(uint8_t pin) {
+#ifdef ESP32
+    if (pin > 33) return false;                    // 34-39 are input-only
+    if (pin >= 6 && pin <= 11) return false;       // flash
+    if (pin == 20 || (pin >= 24 && pin <= 31)) return false; // not broken out on ESP32
+    if (pin == 1 || pin == 3) return false;        // UART0 / USB serial
+    for (uint8_t r : SD_RESERVED_PINS) if (pin == r) return false;
+    return true;
+#else
+    return pin == PIXEL_PIN;
+#endif
+}
+
+bool validateOutputs(const OutputCfg* o, uint8_t n, String& err) {
+    if (n < 1 || n > MAX_OUTPUTS) { err = "1 to " + String(MAX_OUTPUTS) + " outputs required"; return false; }
+#ifndef ESP32
+    if (n != 1) { err = "ESP8266 supports a single output"; return false; }
+#endif
+    uint32_t total = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        String tag = "Output " + String(i + 1) + ": ";
+        if (!pinUsable(o[i].pin)) { err = tag + "GPIO " + String(o[i].pin) + " not usable"; return false; }
+        for (uint8_t k = 0; k < i; k++)
+            if (o[k].pin == o[i].pin) { err = tag + "GPIO " + String(o[i].pin) + " used twice"; return false; }
+        if (o[i].type == OutType::PIXEL) {
+#ifndef ESP32
+            if (strlen(o[i].order) != 3) { err = tag + "ESP8266 supports RGB-order (3 channel) pixels only"; return false; }
+#endif
+            if (!orderValid(o[i].order)) { err = tag + "bad colour order"; return false; }
+            if (o[i].count < 1 || o[i].count > MAX_PIXELS_PER_OUT) {
+                err = tag + "pixel count must be 1 to " + String(MAX_PIXELS_PER_OUT); return false;
+            }
+        } else {
+#ifndef ESP32
+            err = tag + "PWM needs an ESP32"; return false;
+#endif
+            if (o[i].freq < 1 || o[i].freq > 40000) { err = tag + "PWM frequency must be 1 to 40000 Hz"; return false; }
+        }
+        total += channelsOf(o[i]);
+    }
+    if (total > MAX_TOTAL_CHANNELS) { err = "Too many channels (" + String(total) + ", max " + String(MAX_TOTAL_CHANNELS) + ")"; return false; }
+    return true;
+}
+
+struct Output {
+    OutputCfg cfg;
+    uint32_t  start    = 0;   // first channel
+    uint32_t  channels = 0;
+    uint8_t   bpp      = 3;   // channels per pixel
+    uint8_t   map[4]   = {0, 1, 2, 3}; // wire byte i <- logical channel map[i]
+#ifdef ESP32
+    rmt_data_t* sym    = nullptr;
+    bool        ok     = false;
+#endif
+};
+
+Output   outputs[MAX_OUTPUTS];
+uint8_t  outputCount = 0;
+uint8_t* chan        = nullptr;   // logical channel buffer, gamma already applied
+uint32_t totalCh     = 0;
+
+#ifdef ESP32
+// RMT tick = 100 ns. 0 = 0.3 us high / 0.9 us low, 1 = 0.7 us high / 0.5 us low
+// — inside the tolerance of WS2811 (800 kHz), WS2812 and SK6812.
+static rmt_data_t mkSym(uint16_t d0, uint8_t l0, uint16_t d1, uint8_t l1) {
+    rmt_data_t s; s.duration0 = d0; s.level0 = l0; s.duration1 = d1; s.level1 = l1; return s;
+}
+static const uint32_t RMT_TICK_HZ = 10000000;
+#endif
+
+void initOutputs() {
+    outputCount = config.outputCount;
+    totalCh     = 0;
+    for (uint8_t i = 0; i < outputCount; i++) {
+        Output& o = outputs[i];
+        o.cfg      = config.outputs[i];
+        o.start    = totalCh;
+        o.channels = channelsOf(o.cfg);
+        o.bpp      = strlen(o.cfg.order);
+        for (uint8_t b = 0; b < o.bpp; b++)
+            o.map[b] = strchr("RGBW", o.cfg.order[b]) - "RGBW";
+        totalCh   += o.channels;
+    }
+    free(chan);
+    chan = (uint8_t*)calloc(totalCh ? totalCh : 1, 1);
+
+    for (uint8_t i = 0; i < outputCount; i++) {
+        Output& o = outputs[i];
+#ifdef ESP32
+        if (o.cfg.type == OutType::PWM) {
+            o.ok = ledcAttach(o.cfg.pin, o.cfg.freq, 8);
+        } else {
+            o.sym = (rmt_data_t*)malloc((o.channels * 8 + 1) * sizeof(rmt_data_t));
+            o.ok  = o.sym && rmtInit(o.cfg.pin, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, RMT_TICK_HZ);
+        }
+        Serial.printf("Output %u: GPIO%u %s %s x%u  ch %u..%u  %s\n", i + 1, o.cfg.pin,
+            o.cfg.type == OutType::PWM ? "PWM" : "pixel",
+            o.cfg.type == OutType::PWM ? "" : o.cfg.order,
+            o.cfg.type == OutType::PWM ? 1 : o.cfg.count,
+            o.start, o.start + o.channels - 1, o.ok ? "ok" : "INIT FAILED");
+#else
+        strip = new PixelStrip(o.cfg.count);
+        strip->Begin();
+#endif
+    }
+}
+
+// Push the channel buffer to every output. Never blocks: a pixel output whose
+// previous frame is still on the wire skips this one and picks up the newer
+// data next time.
+void showOutputs() {
+    for (uint8_t i = 0; i < outputCount; i++) {
+        Output& o = outputs[i];
+        const uint8_t* src = chan + o.start;
+#ifdef ESP32
+        if (!o.ok) continue;
+        if (o.cfg.type == OutType::PWM) { ledcWrite(o.cfg.pin, src[0]); continue; }
+        if (!rmtTransmitCompleted(o.cfg.pin)) continue;
+
+        static const rmt_data_t ZERO = mkSym(3, 1, 9, 0), ONE = mkSym(7, 1, 5, 0), LATCH = mkSym(1500, 0, 1500, 0);
+        size_t n = 0;
+        for (uint16_t p = 0; p < o.cfg.count; p++) {
+            for (uint8_t b = 0; b < o.bpp; b++) {
+                uint8_t v = src[p * o.bpp + o.map[b]];
+                for (int bit = 7; bit >= 0; bit--) o.sym[n++] = (v >> bit) & 1 ? ONE : ZERO;
+            }
+        }
+        o.sym[n++] = LATCH;
+        rmtWriteAsync(o.cfg.pin, o.sym, n);
+#else
+        uint8_t* dst = strip->Pixels();
+        for (uint16_t p = 0; p < o.cfg.count; p++)
+            for (uint8_t b = 0; b < 3; b++) dst[p * 3 + b] = src[p * 3 + o.map[b]];
+        strip->Dirty();
+        if (strip->CanShow()) strip->Show();
+#endif
+    }
+}
+
+void fillOutputs(uint8_t value) {
+    memset(chan, value, totalCh);
+    showOutputs();
+}
 
 // ── FSEQ playback ─────────────────────────────────────────────────────────────
 
@@ -167,19 +390,12 @@ void renderFrame(uint32_t frameNum) {
 
             for (uint16_t i = 0; i < chunk; i++) {
                 uint32_t ch = chStart + done + i;
-                uint16_t px = ch / 3;
-                uint8_t  co = ch % 3;
-                if (px >= config.pixelCount) continue;
-                RgbColor c = strip->GetPixelColor(px);
-                if      (co == 0) c.R = rdBuf[i];
-                else if (co == 1) c.G = rdBuf[i];
-                else              c.B = rdBuf[i];
-                strip->SetPixelColor(px, c);
+                if (ch < totalCh) chan[ch] = gammaLUT[rdBuf[i]];
             }
             done += chunk;
         }
     }
-    strip->Show();
+    showOutputs();
 }
 
 void updatePlayback() {
@@ -226,14 +442,16 @@ void handleDDP() {
 
         if (header[0] & DDP_FLAG_PUSH) pushed = true;
 
-        uint16_t pixelStart = byteOffset / 3;
-        uint16_t pixelCount = byteLen    / 3;
-
-        for (uint16_t i = 0; i < pixelCount; i++) {
-            uint8_t rgb[3] = {0, 0, 0};
-            if (ddpUdp.read(rgb, 3) < 3) break;
-            if (pixelStart + i < config.pixelCount)
-                strip->SetPixelColor(pixelStart + i, RgbColor(rgb[0], rgb[1], rgb[2]));
+        uint8_t buf[128];
+        uint16_t done = 0;
+        while (done < byteLen) {
+            int got = ddpUdp.read(buf, min((uint16_t)sizeof(buf), (uint16_t)(byteLen - done)));
+            if (got <= 0) break;
+            for (int i = 0; i < got; i++) {
+                uint32_t ch = byteOffset + done + i;
+                if (ch < totalCh) chan[ch] = gammaLUT[buf[i]];
+            }
+            done += got;
         }
         touched = true;
     }
@@ -244,14 +462,11 @@ void handleDDP() {
     static uint32_t lastLog = 0;
     if (millis() - lastLog > 2000) {
         lastLog = millis();
-        Serial.printf("DDP: drained=%u push=%d canShow=%d\n",
-                      drained, pushed, strip->CanShow());
+        Serial.printf("DDP: drained=%u push=%d\n", drained, pushed);
     }
 
-    // Non-blocking latch. If the previous transmit is still on the wire we skip
-    // this one and keep the newer data — dropping a stale frame beats blocking
-    // loop() and backing up the receive queue.
-    if (strip->CanShow()) strip->Show();
+    // Non-blocking: outputs still transmitting skip this frame (see showOutputs)
+    showOutputs();
 }
 
 // ── FPP packets ───────────────────────────────────────────────────────────────
@@ -292,7 +507,7 @@ void sendFPPPing(IPAddress dest) {
     pkt[6]  = 294 >> 8;
     pkt[7]  = 0x03;          // ping_version
     pkt[8]  = 0x00;          // ping_subtype: announce (not a discover request)
-    pkt[9]  = 0xC2;          // ping_hardware: ESP8266
+    pkt[9]  = FPP_TYPE_ESP;   // ping_hardware
     pkt[10] = FW_VERSION_MAJOR >> 8; pkt[11] = FW_VERSION_MAJOR & 0xFF; // BE
     pkt[12] = FW_VERSION_MINOR >> 8; pkt[13] = FW_VERSION_MINOR & 0xFF;
     pkt[14] = 0x08;           // operatingMode: bridge
@@ -300,7 +515,7 @@ void sendFPPPing(IPAddress dest) {
     memcpy(pkt + 15, &ip, 4);
     strncpy((char*)(pkt + 19),  config.hostname.c_str(), 64);
     strncpy((char*)(pkt + 84),  FW_VERSION,              40);
-    strncpy((char*)(pkt + 125), "ESPixelStick-ESP8266",  40);
+    strncpy((char*)(pkt + 125), FPP_HW_NAME,             40);
     // ranges[121] at [166] — empty = whole universe
 
     fppUdp.beginPacket(dest, FPP_PORT);
@@ -385,51 +600,38 @@ void handleFPPPacket() {
             case 1: // Stop
                 Serial.println("FPP stop");
                 closeSequence();
-                strip->ClearTo(RgbColor(0));
-                strip->Show();
+                fillOutputs(0);
                 break;
         }
     }
 }
 
-// ── Animation ─────────────────────────────────────────────────────────────────
+// ── Idle blanking ─────────────────────────────────────────────────────────────
 
-void updateAnimation() {
-    if (!strip) return;
-    if ((millis() - lastDdpMs) < DDP_TIMEOUT_MS) return;
-    if (playState != PlayState::IDLE) return;
+// When DDP has gone quiet and nothing is playing, black everything out once.
+// Any new DDP or playback re-arms it.
+void updateIdle() {
+    if (!chan) return;
+    static bool blanked = false;
 
-    static bool     needClear = false;
-    static uint32_t lastFrame = 0;
+    bool active = (millis() - lastDdpMs) < DDP_TIMEOUT_MS || playState != PlayState::IDLE;
+    if (active) { blanked = false; return; }
+    if (blanked) return;
 
-    if (!config.animationEnabled) {
-        if (!needClear) {
-            strip->ClearTo(RgbColor(0));
-            strip->Show();
-            needClear = true;
-        }
-        return;
-    }
-    needClear = false;
-
-    uint32_t now = millis();
-    if (now - lastFrame < 20) return;
-    lastFrame = now;
-
-    float   t          = (float)(now % 5000) / 5000.0f;
-    float   brightness = t < 0.5f ? t * 2.0f : (1.0f - t) * 2.0f;
-    uint8_t val        = (uint8_t)(brightness * 255);
-
-    RgbColor white(val, val, val);
-    for (uint16_t i = 0; i < config.pixelCount; i++)
-        strip->SetPixelColor(i, white);
-    strip->Show();
+    fillOutputs(0);
+    blanked = true;
 }
 
 // ── SD helpers ────────────────────────────────────────────────────────────────
 
+#ifdef ESP32
+static const uint8_t SD_SPI_MHZ = 20;
+#else
+static const uint8_t SD_SPI_MHZ = 4;
+#endif
+
 void initSD() {
-    sdAvailable = sd.begin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(4)));
+    sdAvailable = sd.begin(SdSpiConfig(SD_CS_PIN, SHARED_SPI, SD_SCK_MHZ(SD_SPI_MHZ)));
     Serial.println(sdAvailable ? "SD ready" : "SD not found");
 }
 
@@ -492,6 +694,38 @@ static String buildSDContent() {
 
 // ── Config persistence ────────────────────────────────────────────────────────
 
+static void outputsToJson(JsonArray arr) {
+    for (uint8_t i = 0; i < config.outputCount; i++) {
+        const OutputCfg& o = config.outputs[i];
+        JsonObject j = arr.add<JsonObject>();
+        j["pin"] = o.pin;
+        if (o.type == OutType::PWM) {
+            j["type"] = "pwm";
+            j["freq"] = o.freq;
+        } else {
+            j["type"]  = "pixel";
+            j["order"] = o.order;
+            j["count"] = o.count;
+        }
+    }
+}
+
+// Parses into scratch space and validates; only a fully valid list is returned.
+static bool outputsFromJson(JsonArrayConst arr, OutputCfg* out, uint8_t& n, String& err) {
+    if (arr.size() > MAX_OUTPUTS) { err = "Too many outputs"; return false; }
+    n = 0;
+    for (JsonObjectConst j : arr) {
+        OutputCfg& o = out[n++];
+        o = OutputCfg();
+        o.pin  = j["pin"] | PIXEL_PIN;
+        o.type = String(j["type"] | "pixel") == "pwm" ? OutType::PWM : OutType::PIXEL;
+        o.freq = j["freq"] | 1000;
+        o.count = j["count"] | 30;
+        strlcpy(o.order, j["order"] | "RGB", sizeof(o.order));
+    }
+    return validateOutputs(out, n, err);
+}
+
 bool loadConfig() {
     if (!LittleFS.exists(CONFIG_FILE)) return false;
     File f = LittleFS.open(CONFIG_FILE, "r");
@@ -503,8 +737,21 @@ bool loadConfig() {
     config.ssid             = doc["ssid"]             | "";
     config.password         = doc["password"]         | "";
     config.hostname         = doc["hostname"]         | "pixelcontroller";
-    config.pixelCount       = doc["pixelCount"]       | 30;
-    config.animationEnabled = doc["animationEnabled"] | true;
+    config.gamma            = doc["gamma"]            | 1.0f;
+
+    // No "outputs" key: configs from before multi-output carry a bare pixelCount
+    OutputCfg tmp[MAX_OUTPUTS];
+    uint8_t   n = 0;
+    String    verr;
+    if (doc["outputs"].is<JsonArray>() && outputsFromJson(doc["outputs"], tmp, n, verr)) {
+        for (uint8_t i = 0; i < n; i++) config.outputs[i] = tmp[i];
+        config.outputCount = n;
+    } else {
+        config.outputs[0]       = OutputCfg();
+        config.outputs[0].count = doc["pixelCount"] | 30;
+        config.outputCount      = 1;
+    }
+    rebuildGammaLUT();
     return config.ssid.length() > 0;
 }
 
@@ -515,8 +762,8 @@ void saveConfig() {
     doc["ssid"]             = config.ssid;
     doc["password"]         = config.password;
     doc["hostname"]         = config.hostname;
-    doc["pixelCount"]       = config.pixelCount;
-    doc["animationEnabled"] = config.animationEnabled;
+    doc["gamma"]            = config.gamma;
+    outputsToJson(doc["outputs"].to<JsonArray>());
     serializeJson(doc, f);
     f.close();
 }
@@ -563,7 +810,8 @@ a.btn{display:block;margin-top:12px;padding:10px;text-align:center;border-radius
 <div class="row"><span class="key">Network</span><span>%SSID%</span></div>
 <div class="row"><span class="key">IP address</span><span>%IP%</span></div>
 <div class="row"><span class="key">Signal</span><span>%RSSI% dBm</span></div>
-<div class="row"><span class="key">Pixels</span><span>%PIXEL_COUNT% (WS2811)</span></div>
+<div class="row"><span class="key">Outputs</span><span>%OUTPUTS%</span></div>
+<div class="row"><span class="key">Gamma</span><span>%GAMMA%</span></div>
 <div class="row"><span class="key">DDP</span><span>port 4048 &mdash; %DDP_STATUS%</span></div>
 <div class="row"><span class="key">SD card</span><span>%SD_STATUS%</span></div>
 <div class="row"><span class="key">Playback</span><span>%PLAY_STATUS%</span></div>
@@ -577,27 +825,88 @@ a.btn{display:block;margin-top:12px;padding:10px;text-align:center;border-radius
 static const char PIXELS_PAGE[] PROGMEM = R"html(
 <!DOCTYPE html><html>
 <head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pixel Config</title>
-<style>body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px;color:#333}
+<title>Outputs</title>
+<style>body{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#333}
 h1{margin-bottom:4px}p.sub{color:#666;margin-top:0;font-size:.9em}
 label{display:block;margin-top:14px;font-weight:600;font-size:.9em}
-input[type=number]{width:100%;padding:8px;margin-top:4px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;font-size:1em}
+table{width:100%;border-collapse:collapse;margin-top:14px;font-size:.9em}
+th{text-align:left;padding:4px;border-bottom:2px solid #ddd;color:#555}
+td{padding:4px;border-bottom:1px solid #f0f0f0}
+select,input[type=number]{padding:6px;border:1px solid #ccc;border-radius:4px;font-size:1em;box-sizing:border-box;max-width:100%}
+td input[type=number]{width:90px}.ch{color:#888;white-space:nowrap}
 .check-row{display:flex;align-items:center;gap:10px;margin-top:16px}
-.check-row input{width:auto;margin:0}.check-row label{margin:0;font-weight:normal;font-size:1em}
-button{margin-top:20px;width:100%;padding:11px;background:#198754;color:#fff;border:none;border-radius:4px;font-size:1em;cursor:pointer}
-button:hover{background:#157347}.hint{color:#888;font-size:.82em;margin-top:12px}</style>
+.check-row label{margin:0;font-weight:normal;font-size:1em}
+button{padding:10px 16px;border:none;border-radius:4px;font-size:1em;cursor:pointer;color:#fff;background:#198754}
+button.sec{background:#6c757d;margin-top:12px}button.x{background:#dc3545;padding:4px 10px}
+#msg{margin-top:12px;min-height:1.2em;font-size:.9em}.err{color:#dc3545}.hint{color:#888;font-size:.82em;margin-top:12px}</style>
 </head><body>
-<h1>Pixel Config</h1><p class="sub">Output: GPIO2 (D4) &mdash; WS2811</p>
-<form method="POST" action="/pixels">
-  <label>Number of pixels</label>
-  <input type="number" name="pixelCount" value="%PIXEL_COUNT%" min="1" max="1024">
-  <div class="check-row">
-    <input type="checkbox" name="animationEnabled" id="anim" value="1" %ANIM_CHECKED%>
-    <label for="anim">Enable idle animation (ramps when no DDP or sequence playing)</label>
-  </div>
-  <button type="submit">Save &amp; Restart</button>
-</form>
-<p class="hint">DDP (port 4048) and FPP sync always take priority. Animation resumes after %TIMEOUT%s of silence.</p>
+<h1>Outputs</h1><p class="sub">Each output is one GPIO. Channels are assigned in list order.</p>
+<table><thead><tr><th>#<th>GPIO<th>Type<th>Order / Hz<th>Pixels<th>Channels<th></tr></thead><tbody id="rows"></tbody></table>
+<button class="sec" id="add">+ Add output</button>
+<label>Gamma correction</label>
+<input type="number" id="gamma" min="0.1" max="5" step="0.1">
+<p><button id="save">Save &amp; Restart</button></p>
+<div id="msg"></div>
+<p class="hint">Gamma 1.0 = none; ~2.2 suits most WS2811 strips and also evens out PWM dimming. Pixel order is the strip's wire order; the channel data from xLights is always R,G,B(,W). PWM outputs use one channel each (8-bit).</p>
+<p class="hint">DDP (port 4048) and FPP sync always take priority. All outputs go black after %TIMEOUT%s of silence.</p>
+<script>
+var cfg,rows=document.getElementById('rows'),msg=document.getElementById('msg');
+var orders=[];
+function perm(a,p,o){if(!a.length){o.push(p);return}for(var i=0;i<a.length;i++)perm(a.slice(0,i).concat(a.slice(i+1)),p+a[i],o)}
+perm(['R','G','B'],'',orders);perm(['R','G','B','W'],'',orders);
+function opt(vals,sel){return vals.map(function(v){return '<option'+(v==sel?' selected':'')+'>'+v+'</option>'}).join('')}
+function addRow(o){
+  var tr=document.createElement('tr');
+  var pins=cfg.pins.map(function(p){return '<option'+(p==o.pin?' selected':'')+'>'+p+'</option>'}).join('');
+  tr.innerHTML='<td class=n><td><select class=pin>'+pins+'</select>'
+   +'<td><select class=type><option value=pixel>Pixels</option>'+(cfg.esp32?'<option value=pwm>PWM</option>':'')+'</select>'
+   +'<td><select class=order>'+opt(cfg.esp32?orders:orders.slice(0,6),o.order||'RGB')+'</select><input type=number class=freq min=1 max=40000>'
+   +'<td><input type=number class=count min=1 max='+cfg.maxPixels+'><td class=ch><td><button class=x>&times;</button>';
+  tr.querySelector('.type').value=o.type||'pixel';
+  tr.querySelector('.freq').value=o.freq||1000;
+  tr.querySelector('.count').value=o.count||30;
+  tr.addEventListener('input',refresh);
+  tr.querySelector('.x').onclick=function(){tr.remove();refresh()};
+  rows.appendChild(tr);
+}
+function refresh(){
+  var c=0;
+  [].forEach.call(rows.children,function(tr,i){
+    var pwm=tr.querySelector('.type').value=='pwm';
+    tr.querySelector('.n').textContent=i+1;
+    tr.querySelector('.order').style.display=pwm?'none':'';
+    tr.querySelector('.freq').style.display=pwm?'':'none';
+    tr.querySelector('.count').style.display=pwm?'none':'';
+    var n=pwm?1:tr.querySelector('.count').value*tr.querySelector('.order').value.length;
+    tr.querySelector('.ch').textContent=n?(c+1)+'–'+(c+n):'';
+    c+=n;
+  });
+  document.getElementById('add').style.display=rows.children.length>=cfg.maxOutputs?'none':'';
+  document.querySelectorAll('.x').forEach(function(b){b.style.display=rows.children.length>1?'':'none'});
+}
+document.getElementById('add').onclick=function(){
+  var used=[].map.call(rows.querySelectorAll('.pin'),function(s){return +s.value});
+  var free=cfg.pins.filter(function(p){return used.indexOf(p)<0})[0];
+  addRow({pin:free===undefined?cfg.pins[0]:free});refresh();
+};
+document.getElementById('save').onclick=function(){
+  var outs=[].map.call(rows.children,function(tr){
+    var pwm=tr.querySelector('.type').value=='pwm',o={pin:+tr.querySelector('.pin').value,type:tr.querySelector('.type').value};
+    if(pwm)o.freq=+tr.querySelector('.freq').value;else{o.order=tr.querySelector('.order').value;o.count=+tr.querySelector('.count').value}
+    return o});
+  var body={gamma:+document.getElementById('gamma').value,outputs:outs};
+  msg.className='';msg.textContent='Saving…';
+  fetch('/api/outputs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.text().then(function(t){
+     if(r.ok){msg.textContent='Saved. Restarting…';setTimeout(function(){location.href='/'},5000)}
+     else{msg.className='err';msg.textContent=t}})})
+   .catch(function(){msg.className='err';msg.textContent='Request failed'});
+};
+fetch('/api/outputs').then(function(r){return r.json()}).then(function(c){
+  cfg=c;document.getElementById('gamma').value=c.gamma;
+  c.outputs.forEach(addRow);refresh();
+});
+</script>
 </body></html>
 )html";
 
@@ -697,7 +1006,8 @@ void handleRoot() {
     page.replace("%SSID%",        config.ssid);
     page.replace("%IP%",          WiFi.localIP().toString());
     page.replace("%RSSI%",        String(WiFi.RSSI()));
-    page.replace("%PIXEL_COUNT%", String(config.pixelCount));
+    page.replace("%OUTPUTS%",     String(config.outputCount) + " (" + String(totalCh) + " ch)");
+    page.replace("%GAMMA%",       String(config.gamma, 1));
     page.replace("%DDP_STATUS%",  ddpActive ? "active" : "idle");
     page.replace("%SD_STATUS%",   sdAvailable ? "present" : "not detected");
     page.replace("%PLAY_STATUS%", playStatus);
@@ -727,20 +1037,49 @@ void handleSave() {
 
 void handlePixelsGet() {
     String page = FPSTR(PIXELS_PAGE);
-    page.replace("%PIXEL_COUNT%",  String(config.pixelCount));
-    page.replace("%ANIM_CHECKED%", config.animationEnabled ? "checked" : "");
-    page.replace("%TIMEOUT%",      String(DDP_TIMEOUT_MS / 1000));
+    page.replace("%TIMEOUT%", String(DDP_TIMEOUT_MS / 1000));
     server.send(200, "text/html", page);
 }
 
-void handlePixelsPost() {
-    if (server.hasArg("pixelCount")) {
-        int count = server.arg("pixelCount").toInt();
-        if (count > 0 && count <= 1024) config.pixelCount = (uint16_t)count;
+void handleOutputsGet() {
+    JsonDocument doc;
+#ifdef ESP32
+    doc["esp32"] = true;
+#else
+    doc["esp32"] = false;
+#endif
+    doc["gamma"]            = config.gamma;
+    doc["maxOutputs"]       = MAX_OUTPUTS;
+    doc["maxPixels"]        = MAX_PIXELS_PER_OUT;
+    JsonArray pins = doc["pins"].to<JsonArray>();
+    for (uint8_t p = 0; p < 40; p++) if (pinUsable(p)) pins.add(p);
+    outputsToJson(doc["outputs"].to<JsonArray>());
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+void handleOutputsPost() {
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "text/plain", "Bad JSON");
+        return;
     }
-    config.animationEnabled = server.hasArg("animationEnabled");
+    OutputCfg tmp[MAX_OUTPUTS];
+    uint8_t   n = 0;
+    String    err;
+    if (!outputsFromJson(doc["outputs"].as<JsonArrayConst>(), tmp, n, err)) {
+        server.send(400, "text/plain", err);
+        return;
+    }
+    float gamma = doc["gamma"] | config.gamma;
+    if (gamma < 0.1f || gamma > 5.0f) { server.send(400, "text/plain", "Gamma must be 0.1 to 5"); return; }
+
+    for (uint8_t i = 0; i < n; i++) config.outputs[i] = tmp[i];
+    config.outputCount      = n;
+    config.gamma            = gamma;
     saveConfig();
-    server.send(200, "text/html", "<html><body><h2>Saved! Restarting...</h2></body></html>");
+    server.send(200, "text/plain", "OK");
     delay(1000);
     ESP.restart();
 }
@@ -767,8 +1106,7 @@ void handlePlayGet() {
 
 void handleStopGet() {
     closeSequence();
-    strip->ClearTo(RgbColor(0));
-    strip->Show();
+    fillOutputs(0);
     server.sendHeader("Location", "/sd");
     server.send(302, "text/plain", "");
 }
@@ -782,12 +1120,12 @@ static void fppSysInfo(JsonObject o) {
     o["HostName"]        = config.hostname;
     o["HostDescription"] = config.hostname;
     o["Platform"]        = "ESPixelStick";
-    o["Variant"]         = "PixelController-ESP8266";
+    o["Variant"]         = FPP_VARIANT;
     o["Mode"]            = sdAvailable ? "remote" : "bridge";
     o["Version"]         = FW_VERSION;
     o["majorVersion"]    = FW_VERSION_MAJOR;
     o["minorVersion"]    = FW_VERSION_MINOR;
-    o["typeId"]          = FPP_TYPE_ESP8266;
+    o["typeId"]          = FPP_TYPE_ESP;
     o["UUID"]            = WiFi.macAddress();
 
     JsonObject util = o["Utilization"].to<JsonObject>();
@@ -974,7 +1312,11 @@ void startStation() {
     ArduinoOTA.begin();
 
     ddpUdp.begin(DDP_PORT);
+#ifdef ESP32
+    fppUdp.beginMulticast(IPAddress(239, 70, 80, 80), FPP_PORT);
+#else
     fppUdp.beginMulticast(WiFi.localIP(), IPAddress(239, 70, 80, 80), FPP_PORT);
+#endif
     sendFPPPing(IPAddress(239, 70, 80, 80));
     sendFPPPing(WiFi.broadcastIP());
 
@@ -983,7 +1325,8 @@ void startStation() {
     server.on("/wifi",   HTTP_GET,  handleWifi);
     server.on("/save",   HTTP_POST, handleSave);
     server.on("/pixels", HTTP_GET,  handlePixelsGet);
-    server.on("/pixels", HTTP_POST, handlePixelsPost);
+    server.on("/api/outputs", HTTP_GET,  handleOutputsGet);
+    server.on("/api/outputs", HTTP_POST, handleOutputsPost);
     server.on("/sd",     HTTP_GET,  handleSdGet);
     server.on("/play",   HTTP_GET,  handlePlayGet);
     server.on("/stop",   HTTP_GET,  handleStopGet);
@@ -997,8 +1340,8 @@ void startStation() {
     server.onNotFound(handleNotFound);
     server.begin();
 
-    Serial.printf("Connected — IP: %s  hostname: %s.local  pixels: %u\n",
-        WiFi.localIP().toString().c_str(), config.hostname.c_str(), config.pixelCount);
+    Serial.printf("Connected — IP: %s  hostname: %s.local  outputs: %u (%u ch)\n",
+        WiFi.localIP().toString().c_str(), config.hostname.c_str(), outputCount, totalCh);
 }
 
 // ── Arduino entry points ──────────────────────────────────────────────────────
@@ -1006,18 +1349,25 @@ void startStation() {
 void setup() {
     Serial.begin(115200);
     Serial.println();
+#ifdef ESP32
+    LittleFS.begin(true);
+#else
     LittleFS.begin();
+#endif
     loadConfig();
+    rebuildGammaLUT();
     initSD();
 
-    strip = new PixelStrip(config.pixelCount);
-    strip->Begin();
-    strip->ClearTo(RgbColor(0));
-    strip->Show();
+    initOutputs();
+    fillOutputs(0);
 
     if (config.ssid.length() > 0) {
         WiFi.mode(WIFI_STA);
+#ifdef ESP32
+        WiFi.setHostname(config.hostname.c_str());
+#else
         WiFi.hostname(config.hostname);
+#endif
         WiFi.begin(config.ssid, config.password);
         Serial.printf("Connecting to %s", config.ssid.c_str());
         uint32_t start = millis();
@@ -1044,5 +1394,5 @@ void loop() {
         handleFPPPacket();
         updatePlayback();
     }
-    updateAnimation();
+    updateIdle();
 }

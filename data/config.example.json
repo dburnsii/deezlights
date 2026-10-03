@@ -1,1 +1,1 @@
-{"ssid":"YOUR_WIFI_SSID","password":"YOUR_WIFI_PASSWORD","hostname":"pixelcontroller","pixelCount":30,"animationEnabled":true}
+{"ssid":"YOUR_WIFI_SSID","password":"YOUR_WIFI_PASSWORD","hostname":"pixelcontroller","gamma":1.0,"outputs":[{"pin":4,"type":"pixel","order":"RGB","count":30},{"pin":13,"type":"pwm","freq":1000}]}
